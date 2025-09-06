@@ -7,7 +7,7 @@ sdk: docker
 pinned: false
 ---
 
-# Credit Risk Prediction API & Dashboard
+# Credit Risk Prediction API
 
 ## Overview
 

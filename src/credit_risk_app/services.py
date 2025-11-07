@@ -9,8 +9,6 @@ import numpy as np
 
 from fastapi import HTTPException
 
-from .preprocessing import apply_transformations
-
 logger = logging.getLogger(__name__)
 
 # Redirect mlflow file‐store
@@ -21,6 +19,7 @@ class PredictionService:
     """
     Handles the business logic for generating credit risk predictions using
     an MLflow pyfunc model.
+    Expects preprocessed data (transformations already applied at startup).
     """
 
     def __init__(
@@ -61,26 +60,12 @@ class PredictionService:
         self.threshold = threshold
         logger.info(
             f"PredictionService initialized with threshold: {self.threshold:.4f} "
-            f"and {len(self.expected_features)} expected features. Test data index: {self.test_data.index.name}"
+            f"and {len(self.expected_features)} expected features. Test data (preprocessed) index: {self.test_data.index.name}"
         )
-
-    def _validate_data_columns(
-        self, df: pd.DataFrame, required_cols: list[str]
-    ) -> None:
-        """Validates presence of required columns in the DataFrame."""
-        missing = [col for col in required_cols if col not in df.columns]
-        if missing:
-            logger.error(
-                f"Missing required informational columns in selected client data row: {missing}. Available: {list(df.columns)}"
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=f"Internal error: Missing essential data columns {missing} for prediction response.",
-            )
 
     def _select_random_client_data(self) -> tuple[pd.DataFrame, int]:
         """
-        Selects a random client's original data and loan ID.
+        Selects a random client's data and loan ID from preprocessed dataset.
         """
         if self.test_data.empty:
             logger.error("Attempted prediction with empty test_data DataFrame.")
@@ -117,11 +102,8 @@ class PredictionService:
 
     def _extract_client_info(self, row_df_orig: pd.DataFrame, loan_id: int) -> float:
         """
-        Extracts and validates basic client info (credit amount) from the original selected row.
+        Extracts and validates basic client info (credit amount) from the selected row.
         """
-        required_info_cols = ["AMT_CREDIT"]
-        self._validate_data_columns(row_df_orig, required_info_cols)
-
         try:
             credit_amount_raw = row_df_orig["AMT_CREDIT"].item()
         except Exception as e:
@@ -139,30 +121,34 @@ class PredictionService:
         self, row_df_orig: pd.DataFrame, loan_id: int
     ) -> pd.DataFrame:
         """
-        Preprocesses the client's data using expected features.
+        Validates that preprocessed data has the expected features in correct order.
         """
         logger.debug(
-            f"Preprocessing data for Loan ID: {loan_id} (Index: {row_df_orig.index.item()}) "
-            f"using {len(self.expected_features)} expected features."
-        )
-        processed_row_df = apply_transformations(row_df_orig, self.expected_features)
-
-        logger.debug(
-            f"Preprocessing complete for Loan ID: {loan_id}. "
-            f"Processed DataFrame shape: {processed_row_df.shape}, Index: {processed_row_df.index.item()}"
+            f"Validating preprocessed data for Loan ID: {loan_id} (Index: {row_df_orig.index.item()}) "
+            f"against {len(self.expected_features)} expected features."
         )
 
-        # Final check on columns
-        if list(processed_row_df.columns) != self.expected_features:
-            logger.error(
-                f"Column mismatch after preprocessing for Loan ID {loan_id}. "
-                f"Expected: {self.expected_features}, Got: {list(processed_row_df.columns)}"
+        if list(row_df_orig.columns) != self.expected_features:
+            missing = set(self.expected_features) - set(row_df_orig.columns)
+            extra = set(row_df_orig.columns) - set(self.expected_features)
+            error_msg = (
+                f"Column mismatch for Loan ID {loan_id}. "
+                f"Missing: {missing}, Extra: {extra}. "
+                f"Expected: {self.expected_features}"
             )
+            logger.error(error_msg)
             raise HTTPException(
                 status_code=500,
-                detail="Internal error: Feature mismatch after preprocessing.",
+                detail="Internal error: Feature mismatch in preprocessed data.",
             )
-        return processed_row_df
+
+        # Select features in correct order (model expects specific order)
+        validated_row_df = row_df_orig[self.expected_features]
+
+        logger.debug(
+            f"Validation complete for Loan ID: {loan_id}. Shape: {validated_row_df.shape}"
+        )
+        return validated_row_df
 
     def _get_model_prediction(
         self, processed_row_df: pd.DataFrame, loan_id: int
@@ -229,13 +215,13 @@ class PredictionService:
             "threshold": round(float(self.threshold), 4),
             "probability_neg": round(p_neg, 4),
             "probability_pos": round(p_pos, 4),
-            "loan_id": loan_id,  # Already int
+            "loan_id": loan_id,
             "credit_amount": round(credit_amount, 2),
         }
 
     def get_prediction_for_random_client(self) -> Dict[str, Any]:
         """
-        Orchestrates the full process of selecting a client, preprocessing,
+        Orchestrates the full process of selecting a client (from preprocessed data),
         predicting, and formatting the response.
         """
         loan_id_for_log: Any = "unknown_yet"
@@ -245,7 +231,7 @@ class PredictionService:
 
             credit_amount = self._extract_client_info(row_df_orig, loan_id)
             logger.info(
-                f"Processing prediction request for Loan ID: {loan_id}, Amount: {credit_amount}"
+                f"Processing prediction for Loan ID: {loan_id}, Amount: {credit_amount} (data already preprocessed)"
             )
 
             processed_row_df = self._preprocess_client_data(row_df_orig, loan_id)
@@ -309,10 +295,12 @@ class PredictionService:
 
     def get_prediction_for_specific_client(self, loan_id: int) -> Dict[str, Any]:
         """
-        Orchestrates the full process of preprocessing, predicting,
+        Orchestrates the full process of validating preprocessed data, predicting,
         and formatting the response for a specific client ID.
         """
-        logger.info(f"Processing prediction request for specific Loan ID: {loan_id}")
+        logger.info(
+            f"Processing prediction for specific Loan ID: {loan_id} (data already preprocessed)"
+        )
         try:
             if loan_id not in self.test_data.index:
                 logger.warning(f"Loan ID {loan_id} not found in test data index.")

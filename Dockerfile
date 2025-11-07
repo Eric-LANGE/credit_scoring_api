@@ -26,4 +26,5 @@ COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
 # 8. Expose & launch
 EXPOSE 7860
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["uvicorn", "src.credit_risk_app.main:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["uvicorn", "credit_risk_app.main:app", "--host", "0.0.0.0", "--port", "7860"]
+

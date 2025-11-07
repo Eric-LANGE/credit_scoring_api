@@ -2,6 +2,7 @@
 import logging
 import anyio
 import mlflow
+import json
 from typing import Optional, List
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -9,11 +10,12 @@ from contextlib import asynccontextmanager
 import pandas as pd
 import uvicorn
 from sklearn import set_config
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, HTTPException, Depends, Response
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, ConfigDict, computed_field
 
 from .config import COLUMNS_TO_IMPORT, DEFAULT_PREDICTION_THRESHOLD
+from .preprocessing import apply_transformations
 from .services import PredictionService
 
 # --- Configuration & Setup ---
@@ -209,14 +211,11 @@ class ModelLoader:
             ):
                 signature_inputs = self._pyfunc_model.metadata.signature.inputs
                 feature_names = None
-                # Check for standard ways to get input names
                 if hasattr(signature_inputs, "input_names") and callable(
                     signature_inputs.input_names
                 ):
                     feature_names = signature_inputs.input_names()
-                elif hasattr(
-                    signature_inputs, "names"
-                ):  # Older MLflow versions might use this
+                elif hasattr(signature_inputs, "names"):
                     feature_names = signature_inputs.names
 
                 if feature_names:
@@ -250,11 +249,9 @@ class ModelLoader:
                 "Pyfunc model or its top-level metadata is not available for threshold extraction. "
                 f"Using default threshold: {self.default_threshold}"
             )
-            # self._threshold is already default_threshold
             self.logger.info(f"Final threshold set to: {self._threshold:.4f}")
             return
 
-        # Access the custom metadata dictionary (passed as `metadata` param during mlflow.pyfunc.log_model)
         custom_model_metadata = self._pyfunc_model.metadata.metadata
 
         if custom_model_metadata and isinstance(custom_model_metadata, dict):
@@ -285,7 +282,7 @@ class ModelLoader:
                 )
         else:
             self.logger.info(
-                "No custom metadata dictionary found in pyfunc model (or it's not a dictionary). "
+                "No custom metadata dictionary found in pyfunc model. "
                 f"Using default threshold: {self.default_threshold}"
             )
 
@@ -294,12 +291,21 @@ class ModelLoader:
 
 class DataLoader:
     def __init__(
-        self, test_data_path: str, columns_to_import: Optional[List[str]] = None
+        self,
+        test_data_path: str,
+        columns_to_import: Optional[List[str]] = None,
+        expected_features: Optional[List[str]] = None,
     ):
         self.test_data_path = test_data_path
         self.columns_to_import = columns_to_import
+        self.expected_features = expected_features
         self.logger = logging.getLogger(self.__class__.__name__)
         self._test_data: Optional[pd.DataFrame] = None
+        self._raw_test_data: Optional[pd.DataFrame] = None
+
+        self.logger.info(
+            f"DataLoader initialized. Will preprocess: {expected_features is not None}"
+        )
 
     def load(self) -> None:
         try:
@@ -308,18 +314,14 @@ class DataLoader:
             )
             num_cols_info = f"using {len(self.columns_to_import) if self.columns_to_import else 'all available'} columns"
 
-            read_csv_kwargs = {}
-            read_csv_kwargs["low_memory"] = False
+            read_csv_kwargs = {"low_memory": False}
             self.logger.info(f"Reading CSV ({num_cols_info}).")
 
             current_test_data = pd.read_csv(
                 self.test_data_path, **cols_kwarg, **read_csv_kwargs
             )
 
-            essential_cols = [
-                "SK_ID_CURR",
-                "AMT_CREDIT",
-            ]
+            essential_cols: List[str] = ["SK_ID_CURR", "AMT_CREDIT"]
             missing_essential = [
                 c for c in essential_cols if c not in current_test_data.columns
             ]
@@ -331,6 +333,7 @@ class DataLoader:
             self.logger.info(
                 f"Test data loaded successfully. Shape: {current_test_data.shape}"
             )
+            self._raw_test_data = current_test_data.copy()
 
             try:
                 current_test_data.set_index(
@@ -339,23 +342,52 @@ class DataLoader:
                 self.logger.info(
                     "Set 'SK_ID_CURR' as index for test data. Index is now verified unique."
                 )
-            except (
-                Exception
-            ) as e:  # Catches errors like non-unique values in SK_ID_CURR
+            except Exception as e:
                 msg = (
                     f"Critical error: Could not set 'SK_ID_CURR' as a unique index. "
                     f"SK_ID_CURR must be unique for consistent client identification. Error: {e}"
                 )
                 self.logger.error(msg, exc_info=True)
                 raise DataLoadError(msg) from e
-            self._test_data = current_test_data
+
+            if self.expected_features:
+                self.logger.info(
+                    f"🔄 Starting full dataset preprocessing ({current_test_data.shape[0]} rows)..."
+                )
+                import time
+
+                start_time = time.time()
+
+                self._test_data = apply_transformations(
+                    current_test_data, self.expected_features
+                )
+
+                elapsed = time.time() - start_time
+                memory_mb = self._test_data.memory_usage(deep=True).sum() / 1e6
+
+                #
+                self.logger.info("Full dataset preprocessing completed!")
+                self.logger.info("Startup metrics:")
+                self.logger.info(f"   - Preprocessing time: {elapsed:.2f}s")
+                self.logger.info(
+                    f"   - Dataset shape: {self._test_data.shape} (rows × columns)"
+                )
+                self.logger.info(f"   - Memory usage: {memory_mb:.1f} MB")
+                self.logger.info(
+                    f"   - Features: {list(self._test_data.columns)[:5]}... ({len(self._test_data.columns)} total)"
+                )
+            else:
+                self.logger.warning(
+                    "No expected_features provided - storing raw data without preprocessing."
+                )
+                self._test_data = current_test_data
 
         except FileNotFoundError as e:
             msg = f"Test data file not found at {self.test_data_path}"
             self.logger.error(msg)
             raise DataNotFoundError(msg) from e
         except ValueError as e:
-            msg = f"Value error loading or processing test data (e.g. column mismatch, bad data): {e}"
+            msg = f"Value error loading or processing test data: {e}"
             self.logger.error(msg, exc_info=True)
             raise DataLoadError(msg) from e
         except Exception as e:
@@ -366,11 +398,19 @@ class DataLoader:
     @property
     def test_data(self) -> pd.DataFrame:
         if self._test_data is None:
-            raise DataError("Test data accessed before successful loading.")
+            raise DataError(
+                "Preprocessed test data accessed before successful loading."
+            )
         return self._test_data
 
+    @property
+    def raw_test_data(self) -> pd.DataFrame:
+        if self._raw_test_data is None:
+            raise DataError("Raw test data accessed before successful loading.")
+        return self._raw_test_data
 
-class ResourceManager:  # Orchestrator
+
+class ResourceManager:
     def __init__(self, model_loader: ModelLoader, data_loader: DataLoader):
         self.model_loader = model_loader
         self.data_loader = data_loader
@@ -378,6 +418,7 @@ class ResourceManager:  # Orchestrator
 
         self._pyfunc_model: Optional[mlflow.pyfunc.PyFuncModel] = None
         self._test_data: Optional[pd.DataFrame] = None
+        self._raw_test_data: Optional[pd.DataFrame] = None
         self._expected_features: Optional[List[str]] = None
         self._threshold: Optional[float] = None
 
@@ -392,6 +433,7 @@ class ResourceManager:  # Orchestrator
 
             self.data_loader.load()
             self._test_data = self.data_loader.test_data
+            self._raw_test_data = self.data_loader.raw_test_data
             self.logger.info("Data resources loaded and processed by orchestrator.")
 
             self.logger.info("All resources successfully loaded and orchestrated.")
@@ -411,6 +453,7 @@ class ResourceManager:  # Orchestrator
         self.logger.info("Releasing orchestrated resources...")
         self._pyfunc_model = None
         self._test_data = None
+        self._raw_test_data = None
         self._expected_features = None
         self._threshold = None
         self.logger.info("Orchestrated resources released.")
@@ -424,8 +467,16 @@ class ResourceManager:  # Orchestrator
     @property
     def test_data(self) -> pd.DataFrame:
         if self._test_data is None:
-            raise ResourceError("Test data not available via ResourceManager.")
+            raise ResourceError(
+                "Preprocessed test data not available via ResourceManager."
+            )
         return self._test_data
+
+    @property
+    def raw_test_data(self) -> pd.DataFrame:
+        if self._raw_test_data is None:
+            raise ResourceError("Raw test data not available via ResourceManager.")
+        return self._raw_test_data
 
     @property
     def expected_features(self) -> List[str]:
@@ -445,7 +496,10 @@ class ResourceManager:  # Orchestrator
 async def lifespan(app: FastAPI):
     logger.info("Application startup: Initializing resource loaders...")
     model_loader = ModelLoader(MODEL_PATH, DEFAULT_PREDICTION_THRESHOLD)
-    data_loader = DataLoader(TEST_DATA_PATH, columns_to_import=COLUMNS_TO_IMPORT)
+
+    data_loader = DataLoader(
+        TEST_DATA_PATH, columns_to_import=COLUMNS_TO_IMPORT, expected_features=None
+    )
     resource_manager = ResourceManager(model_loader, data_loader)
 
     app.state.resource_manager = resource_manager
@@ -453,10 +507,29 @@ async def lifespan(app: FastAPI):
 
     try:
         logger.info(
-            "Application startup: Offloading resource loading to thread pool..."
+            "Application startup: Loading model first to extract expected_features..."
         )
-        await anyio.to_thread.run_sync(resource_manager.load_resources)
-        logger.info("Application startup: Resources reported as loaded by manager.")
+        await anyio.to_thread.run_sync(resource_manager.model_loader.load_all)
+        expected_features = resource_manager.model_loader.expected_features
+        logger.info(
+            f"Application startup: Model loaded. Extracted {len(expected_features)} expected features."
+        )
+
+        logger.info("Application startup: Loading and preprocessing data...")
+        data_loader_with_features = DataLoader(
+            TEST_DATA_PATH,
+            columns_to_import=COLUMNS_TO_IMPORT,
+            expected_features=expected_features,
+        )
+        await anyio.to_thread.run_sync(data_loader_with_features.load)
+
+        resource_manager._test_data = data_loader_with_features.test_data
+        resource_manager._raw_test_data = data_loader_with_features.raw_test_data
+        resource_manager._pyfunc_model = resource_manager.model_loader.pyfunc_model
+        resource_manager._expected_features = expected_features
+        resource_manager._threshold = resource_manager.model_loader.threshold
+
+        logger.info("Application startup: Resources loaded and preprocessed.")
 
         logger.info("Application startup: Initializing PredictionService...")
         app.state.prediction_service = PredictionService(
@@ -473,14 +546,11 @@ async def lifespan(app: FastAPI):
         )
         logger.critical(err_msg, exc_info=True)
         raise RuntimeError(err_msg) from e
-    except (
-        ValueError,  # Can be raised by PredictionService constructor
-        TypeError,
-    ) as service_init_error:  # Broad catch for other unexpected service init issues
+    except (ValueError, TypeError) as service_init_error:
         err_msg = f"Critical startup error: Failed to initialize PredictionService: {service_init_error}"
         logger.critical(err_msg, exc_info=True)
         raise RuntimeError(err_msg) from service_init_error
-    except Exception as e:  # Catch-all for any other unexpected startup error
+    except Exception as e:
         logger.critical(
             f"Application startup failed critically and unexpectedly: {e}",
             exc_info=True,
@@ -495,13 +565,12 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("Application shutdown: Releasing resources...")
-    # Ensure resource_manager exists before trying to release
     if (
         hasattr(app.state, "resource_manager")
         and app.state.resource_manager is not None
     ):
         await anyio.to_thread.run_sync(app.state.resource_manager.release_resources)
-    app.state.prediction_service = None  # Explicitly clear service
+    app.state.prediction_service = None
     logger.info("Application shutdown: Completed.")
 
 
@@ -512,8 +581,7 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "API to predict credit risk for loan applicants. "
-        "Uses MLflow pyfunc model, relies on its signature for feature handling, "
-        "and extracts threshold from model metadata. "
+        "Uses MLflow pyfunc model with preprocessed data. "
     ),
 )
 
@@ -524,13 +592,10 @@ def get_prediction_service(request: Request) -> PredictionService:
         not hasattr(request.app.state, "prediction_service")
         or request.app.state.prediction_service is None
     ):
-        logger.error(
-            "Prediction service accessed but is not available. This indicates a startup failure or incomplete initialization."
-        )
-        # 503 Service Unavailable is appropriate here.
+        logger.error("Prediction service accessed but is not available.")
         raise HTTPException(
             status_code=503,
-            detail="Service unavailable. Critical resources may have failed to load on startup. Check server logs.",
+            detail="Service unavailable. Critical resources may have failed to load on startup.",
         )
     return request.app.state.prediction_service
 
@@ -542,6 +607,12 @@ async def ping():
     return {"message": "pong"}
 
 
+@app.get("/", include_in_schema=False)
+async def root():
+    """Redirects the root URL to the API documentation."""
+    return RedirectResponse(url="/docs")
+
+
 @app.get("/healthz", tags=["Health"])
 async def health_check(request: Request) -> Response:
     if (
@@ -551,19 +622,102 @@ async def health_check(request: Request) -> Response:
         logger.debug("Health check: Service is ready.")
         return JSONResponse({"status": "ok", "message": "Service is ready."})
     else:
-        logger.warning(
-            "Health check: Service is unavailable due to startup issues or incomplete initialization."
-        )
+        logger.warning("Health check: Service is unavailable due to startup issues.")
         return JSONResponse(
             {
                 "status": "unavailable",
                 "message": "Prediction service is not initialized.",
             },
-            status_code=503,  # Service Unavailable
+            status_code=503,
         )
 
 
-@app.get("/predict", response_model=PredictionResponse)
+@app.get("/data", tags=["Data"])
+async def get_preprocessed_data(
+    limit: int = 100, offset: int = 0, request: Request = None
+) -> Response:
+    """
+    Returns preprocessed test data (features ready for model prediction).
+
+    **Use case**: Debugging, feature inspection, integration with BI tools.
+
+    **Parameters**:
+    - `limit`: Number of rows to return (default: 100, max: 1000)
+    - `offset`: Starting row index (default: 0)
+    """
+    if (
+        not hasattr(request.app.state, "resource_manager")
+        or request.app.state.resource_manager is None
+    ):
+        logger.error("Resource manager not available for /data endpoint.")
+        raise HTTPException(status_code=503, detail="Service unavailable.")
+
+    try:
+        preprocessed_data = request.app.state.resource_manager.test_data
+
+        # Validate pagination
+        limit = min(max(1, limit), 1000)
+        offset = max(0, offset)
+
+        # Slice data
+        data_slice = preprocessed_data.iloc[offset : offset + limit]
+
+        logger.info(
+            f"Returning {len(data_slice)} preprocessed rows (offset={offset}, limit={limit})"
+        )
+
+        # This handles ALL pandas/numpy types correctly (including inf, NaN, categorical, etc.)
+        data_json = data_slice.reset_index().to_json(
+            orient="records", date_format="iso"
+        )
+        data_records = json.loads(data_json)
+
+        return JSONResponse(
+            {
+                "total_rows": len(preprocessed_data),
+                "returned_rows": len(data_slice),
+                "offset": offset,
+                "limit": limit,
+                "columns": list(data_slice.columns),
+                "data": data_records,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error in /data endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/data/{loan_id}", tags=["Data"])
+async def get_client_preprocessed_data(
+    loan_id: int, request: Request = None
+) -> Response:
+    """Returns preprocessed features for a specific client."""
+    if (
+        not hasattr(request.app.state, "resource_manager")
+        or request.app.state.resource_manager is None
+    ):
+        raise HTTPException(status_code=503, detail="Service unavailable.")
+
+    try:
+        preprocessed_data = request.app.state.resource_manager.test_data
+        if loan_id not in preprocessed_data.index:
+            raise HTTPException(status_code=404, detail=f"Loan ID {loan_id} not found.")
+
+        client_row = preprocessed_data.loc[[loan_id]]
+
+        # Pandas handles all type conversions when converting to JSON
+        client_json = client_row.to_json(orient="records", date_format="iso")
+        client_data = json.loads(client_json)[0]
+
+        return JSONResponse({"loan_id": loan_id, "features": client_data})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /data/{loan_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/predict", response_model=PredictionResponse, tags=["Predictions"])
 async def predict_random_client_endpoint(
     service: PredictionService = Depends(get_prediction_service),
 ) -> PredictionResponse:
@@ -591,7 +745,7 @@ async def predict_random_client_endpoint(
 
 @app.get("/predict/{loan_id}", response_model=PredictionResponse, tags=["Predictions"])
 async def predict_specific_client_endpoint(
-    loan_id: int,  # Path parameter from URL
+    loan_id: int,
     service: PredictionService = Depends(get_prediction_service),
 ) -> PredictionResponse:
     logger.debug(f"Received request for /predict/{loan_id} endpoint.")

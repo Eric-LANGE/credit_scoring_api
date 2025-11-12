@@ -72,3 +72,7 @@ secrets.yaml
 *.h5
 *.parquet
 *.sqlite3
+
+# Fichiers de présentation et documents
+*.pdf
+*.pptx

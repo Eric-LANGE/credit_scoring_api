@@ -1,6 +1,6 @@
 ---
 title: Credit Risk API
-emoji: 📊
+emoji: ⚖️
 colorFrom: indigo
 colorTo: purple
 sdk: docker

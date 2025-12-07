@@ -1,8 +1,8 @@
 ---
 title: Credit Risk API
 emoji: ⚖️
-colorFrom: indigo
-colorTo: purple
+colorFrom: gray
+colorTo: green
 sdk: docker
 pinned: false
 ---
